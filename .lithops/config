@@ -1,0 +1,14 @@
+lithops:
+    backend: aws_lambda
+    storage: aws_s3
+    log_filename: lithops.log  # comment out to see logs in the console
+    # log_level: WARNING
+
+aws:
+    region: us-east-1                                  # your AWS region
+
+aws_lambda:
+    execution_role: arn:aws:iam::...                   # LambdaExecutionRoleArn
+    user_id: AROAXXXXXXXXXXXXXXXXX                     # GitHubActionsRoleId
+    runtime_memory: 2000
+    runtime_timeout: 180

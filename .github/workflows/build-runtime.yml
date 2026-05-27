@@ -1,0 +1,109 @@
+name: Build and Deploy Lithops Runtime
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.lithops/config'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'
+  RUNTIME_NAME: 'cubed-runtime'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          SECRET: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -n "$SECRET" ]; then
+            echo "configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "configured=false" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read AWS region from config
+        id: config
+        run: |
+          region=$(python3 -c "
+          import yaml
+          with open('.lithops/config') as f:
+              c = yaml.safe_load(f)
+          print(c['aws']['region'].strip())
+          ")
+          echo "region=$region" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ steps.config.outputs.region }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Lithops
+        run: pip install 'lithops[aws]'
+
+      - name: Copy Lithops config
+        run: |
+          mkdir -p ~/.lithops
+          grep -v 'log_filename' .lithops/config > ~/.lithops/config
+
+      - name: Delete existing runtime
+        run: lithops runtime delete -d ${{ env.RUNTIME_NAME }} -b aws_lambda
+
+      - name: Build runtime
+        run: lithops runtime build ${{ env.RUNTIME_NAME }} -b aws_lambda -f Dockerfile
+
+      - name: Grant Lambda access to ECR repository
+        run: |
+          set -euo pipefail
+          region="${{ steps.config.outputs.region }}"
+          runtime="${{ env.RUNTIME_NAME }}"
+          policy='{
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Sid": "LambdaECRAccess",
+              "Effect": "Allow",
+              "Principal": {"Service": "lambda.amazonaws.com"},
+              "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+            }]
+          }'
+          repos=$(aws ecr describe-repositories \
+            --region "$region" \
+            --query 'repositories[].repositoryName' \
+            --output text | tr '\t' '\n' | grep -E "(^|/)${runtime}$" || true)
+          if [ -z "$repos" ]; then
+            echo "ERROR: no ECR repository found for runtime '$runtime' in $region"
+            exit 1
+          fi
+          while IFS= read -r repo; do
+            echo "Setting ECR policy on: $repo"
+            aws ecr set-repository-policy \
+              --region "$region" \
+              --repository-name "$repo" \
+              --policy-text "$policy"
+          done <<< "$repos"
+
+      - name: Deploy runtime
+        run: lithops runtime deploy ${{ env.RUNTIME_NAME }} -b aws_lambda
